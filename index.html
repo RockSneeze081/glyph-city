@@ -1,0 +1,616 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Glyph City — ASCII Cyberpunk Raycaster</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: #000; overflow: hidden;
+    font-family: ui-monospace, Menlo, Consolas, monospace; }
+  #view { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block;
+    image-rendering: pixelated; cursor: crosshair; }
+  #scan { position: fixed; inset: 0; pointer-events: none; z-index: 3;
+    background:
+      repeating-linear-gradient(0deg, rgba(0,0,0,0.16) 0px, rgba(0,0,0,0.16) 1px, transparent 2px, transparent 3px),
+      radial-gradient(ellipse at center, rgba(0,0,0,0) 55%, rgba(0,0,0,0.6) 100%);
+  }
+  #hint { position: fixed; left: 0; right: 0; bottom: 10px; text-align: center;
+    color: #2a8a99; font-size: 11px; letter-spacing: 1px; pointer-events: none; z-index: 4; }
+  #overlay { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 14px; background: rgba(2,4,10,0.88); color: #00f0ff;
+    text-align: center; cursor: pointer; transition: opacity .25s ease; z-index: 5; padding: 24px; }
+  #overlay.hidden { opacity: 0; pointer-events: none; }
+  #overlay h1 { font-size: clamp(22px,4vw,42px); letter-spacing: 6px;
+    text-shadow: 0 0 12px #00f0ff, 0 0 34px #ff2ec4; }
+  #overlay p { color: #8fd8ff; font-size: 14px; line-height: 1.8; max-width: 560px; }
+  #overlay .kbd { color: #ffd400; border: 1px solid #2a5a66; border-radius: 3px; padding: 1px 6px; }
+  #overlay .seed { color: #39ff88; font-size: 12px; letter-spacing: 2px; }
+  #overlay .credit { color: #4a5a66; font-size: 11px; max-width: 560px; }
+  #overlay .credit a { color: #6a8a99; }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<div id="scan"></div>
+<div id="hint">CLICK TO LOOK · WASD MOVE · SHIFT SPRINT · ARROWS TURN/MOVE · M MINIMAP</div>
+<div id="overlay">
+  <h1>GLYPH CITY</h1>
+  <p>A walkable ASCII cyberpunk downtown, rendered live by a 2.5D raycaster —
+     every wall, window and rooftop light on screen is a character, not a pixel.</p>
+  <p><span class="kbd">WASD</span> move &nbsp; <span class="kbd">SHIFT</span> sprint &nbsp;
+     <span class="kbd">MOUSE</span> look &nbsp; <span class="kbd">&larr;/&rarr;</span> turn &nbsp;
+     <span class="kbd">M</span> minimap</p>
+  <p class="seed" id="seedline">SEED …</p>
+  <p>click anywhere to jack in</p>
+  <p class="credit">Inspired by <a href="https://github.com/ludthor/ascii-city" target="_blank" rel="noopener">ludthor/ascii-city</a> — own build, own code.</p>
+</div>
+<script>
+(function () {
+  "use strict";
+
+  var W = 48, H = 48, BLOCK = 12, AVE = 2;
+  var F_STREET = 0, F_SIDEWALK = 1, F_ALLEY = 2, F_PARK = 3, F_PLAZA = 4;
+  var MAX_STEPS = 80;
+  var FOG_MID = 22, FOG_END = 32;
+
+  var PALETTE = [
+    "#000000", "#00f0ff", "#0a6b78", "#ff2ec4", "#7a1660",
+    "#ffd400", "#7a5f00", "#39ff88", "#146b3a", "#5cb8ff",
+    "#1c3d66", "#ff3b3b", "#d8d8de", "#4a4a55", "#262a33", "#ffffff"
+  ];
+  var DIM_OF = [0, 2, 2, 4, 4, 6, 6, 8, 8, 10, 10, 13, 14, 13, 14, 12];
+  var HUE_BRIGHT = [1, 3, 5, 7, 9];
+  var HUE_DIM = [2, 4, 6, 8, 10];
+
+  function CC(s) { return s.charCodeAt(0); }
+  function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+  function hashString(s) {
+    var h = 2166136261;
+    for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return h >>> 0;
+  }
+  function mulberry32(seed) {
+    return function () {
+      seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+      var t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function hash3(a, b, c) {
+    var h = (a * 374761393 + b * 668265263 + c * 2147483647) | 0;
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    h ^= h >>> 16;
+    return h >>> 0;
+  }
+
+  function generateCity(seedStr) {
+    var seedNum = hashString(seedStr);
+    var rnd = mulberry32(seedNum);
+    var n = W * H;
+    var solid = new Uint8Array(n);
+    var floor = new Uint8Array(n);
+    var height = new Uint8Array(n);
+    var hue = new Uint8Array(n);
+    var props = [];
+
+    var blocksX = Math.ceil(W / BLOCK), blocksY = Math.ceil(H / BLOCK);
+    var plazaBX = (blocksX / 2) | 0, plazaBY = (blocksY / 2) | 0;
+    var blockType = new Uint8Array(blocksX * blocksY);
+    for (var by0 = 0; by0 < blocksY; by0++) {
+      for (var bx0 = 0; bx0 < blocksX; bx0++) {
+        var t = 0;
+        if (bx0 === plazaBX && by0 === plazaBY) t = 2;
+        else if (rnd() < 0.14) t = 1;
+        blockType[by0 * blocksX + bx0] = t;
+      }
+    }
+
+    var isz = BLOCK - AVE;
+    for (var y = 0; y < H; y++) {
+      for (var x = 0; x < W; x++) {
+        var idx = y * W + x;
+        var bx = (x / BLOCK) | 0, by = (y / BLOCK) | 0;
+        var lx = x - bx * BLOCK, ly = y - by * BLOCK;
+        var bt = blockType[by * blocksX + bx];
+
+        if (lx < AVE || ly < AVE) { floor[idx] = F_STREET; continue; }
+        if (bt === 1) {
+          floor[idx] = F_PARK;
+          if ((hash3(x, y, seedNum + 5) & 63) === 7) {
+            props.push({ kind: 2, x: x + 0.5, y: y + 0.5, z0: 0, z1: 1.5 + ((x + y) % 3) * 0.3, w: 0.5, seed: (x * 7 + y * 3) % 97 });
+          }
+          continue;
+        }
+        if (bt === 2) { floor[idx] = F_PLAZA; continue; }
+
+        var ix = lx - AVE, iy = ly - AVE;
+        if (ix === 0 || iy === 0 || ix === isz - 1 || iy === isz - 1) {
+          floor[idx] = F_SIDEWALK;
+          if ((x + y) % 7 === 0) {
+            props.push({ kind: 0, x: x + 0.5, y: y + 0.5, z0: 0, z1: 1.3, w: 0.25, seed: (x * 11 + y * 5) % 97 });
+          }
+          continue;
+        }
+
+        var lix = ix - 1, liy = iy - 1;
+        var qx = lix < 3 ? 0 : (lix >= 5 ? 1 : -1);
+        var qy = liy < 3 ? 0 : (liy >= 5 ? 1 : -1);
+        if (qx < 0 || qy < 0) { floor[idx] = F_ALLEY; continue; }
+
+        var qh = hash3(bx * 13 + qx * 7 + 1, by * 17 + qy * 11 + 3, seedNum);
+        var tall = (qh & 7) === 0;
+        var ht = tall ? 11 + ((qh >>> 3) % 16) : 3 + ((qh >>> 3) % 7);
+        solid[idx] = 1;
+        height[idx] = ht;
+        var hueIdx = (qh >>> 9) % 5;
+        hue[idx] = hueIdx;
+        floor[idx] = F_SIDEWALK;
+
+        if (tall) {
+          var cx = qx === 0 ? 1 : 6, cy = qy === 0 ? 1 : 6;
+          if (lix === cx && liy === cy && ((qh >>> 18) & 3) === 0) {
+            props.push({ kind: 1, x: x + 0.5, y: y + 0.5, z0: ht, z1: ht + 1.6, w: 0.3, seed: qh % 97 });
+          }
+        }
+      }
+    }
+
+    var plaza = { x: plazaBX * BLOCK + BLOCK / 2, y: plazaBY * BLOCK + BLOCK / 2 };
+    props.push({ kind: 3, x: plaza.x, y: plaza.y, z0: 0, z1: 9, w: 0.8, seed: 1 });
+
+    return { w: W, h: H, solid: solid, floor: floor, height: height, hue: hue, props: props, plaza: plaza, seed: seedStr };
+  }
+
+  function findSpawn(map) {
+    var cx = (map.w / 2) | 0, cy = (map.h / 2) | 0;
+    for (var r = 0; r < 24; r++) {
+      for (var dy = -r; dy <= r; dy++) {
+        for (var dx = -r; dx <= r; dx++) {
+          if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+          var x = cx + dx, y = cy + dy;
+          if (x < 0 || y < 0 || x >= map.w || y >= map.h) continue;
+          var idx = y * map.w + x;
+          if (!map.solid[idx] && (map.floor[idx] === F_STREET || map.floor[idx] === F_PLAZA)) {
+            return { x: x + 0.5, y: y + 0.5 };
+          }
+        }
+      }
+    }
+    return { x: cx + 0.5, y: cy + 0.5 };
+  }
+
+  function fogPacked(ch, col, dist) {
+    if (dist > FOG_END) return 0;
+    if (dist > FOG_MID) col = DIM_OF[col];
+    return (ch << 8) | col;
+  }
+
+  function sampleWall(u, v, bh, hueIdx, dist, mx, my, side) {
+    var worldZ = bh * (1 - v);
+    var story = worldZ | 0;
+    var sf = worldZ - story;
+    if (sf < 0.1 || sf > 0.9) return fogPacked(CC("="), 13, dist);
+    var bay = u * 4;
+    var bf = bay - (bay | 0);
+    if (bf < 0.12 || bf > 0.88) return fogPacked(CC("|"), 13, dist);
+    var wh = hash3((mx * 131 + my * 7 + side * 97 + (bay | 0) * 29 + 1), story * 761 + 3, hueIdx * 97 + 11);
+    if ((wh & 7) < 3) {
+      var glyphs = [CC("#"), CC("%"), CC("$"), CC("8")];
+      return fogPacked(glyphs[(wh >> 3) & 3], HUE_BRIGHT[hueIdx], dist);
+    }
+    return fogPacked((wh & 16) ? CC(":") : CC("."), HUE_DIM[hueIdx], dist);
+  }
+
+  function sampleFloor(map, wx, wy, dist) {
+    if (dist > FOG_END) return 0;
+    var mx = Math.floor(wx), my = Math.floor(wy);
+    var fl = F_SIDEWALK;
+    if (mx >= 0 && my >= 0 && mx < map.w && my < map.h) fl = map.floor[my * map.w + mx];
+    var su = (((wx - mx) * 4) | 0), sv = (((wy - my) * 4) | 0);
+    var hh = hash3(mx * 4 + su, my * 4 + sv, 9001 + fl * 13);
+    var ch, bright, chance;
+    if (fl === F_STREET) { chance = 10; ch = CC("."); bright = (hh & 63) === 0 ? 1 : 13; }
+    else if (fl === F_SIDEWALK) { chance = 44; ch = CC("."); bright = 12; }
+    else if (fl === F_PARK) { chance = 100; ch = (hh & 4) ? CC(",") : CC('"'); bright = (hh & 8) ? 7 : 8; }
+    else if (fl === F_ALLEY) { chance = 36; ch = CC(":"); bright = 14; }
+    else { chance = 90; ch = (((mx * 2 + su) + (my * 2 + sv)) % 4 === 0) ? CC("+") : CC("."); bright = 9; }
+    if ((hh & 255) >= chance) return 0;
+    return fogPacked(ch, bright, dist);
+  }
+
+  function Display(canvas) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext("2d", { alpha: false });
+    this.cols = 0; this.rows = 0; this.cw = 10; this.ch = 16;
+    this.chars = new Uint16Array(0);
+    this.colors = new Uint8Array(0);
+    this.colZ = new Float32Array(0);
+    this.atlas = null;
+  }
+  Display.prototype.resize = function (vw, vh) {
+    var targetW = 10, targetH = 17;
+    this.cols = clamp((vw / targetW) | 0, 70, 180);
+    this.rows = clamp((vh / targetH) | 0, 30, 70);
+    var dpr = Math.min(1.5, window.devicePixelRatio || 1);
+    this.cw = Math.max(6, Math.floor((vw * dpr) / this.cols));
+    this.ch = Math.max(10, Math.floor((vh * dpr) / this.rows));
+    this.canvas.width = this.cols * this.cw;
+    this.canvas.height = this.rows * this.ch;
+    this.ctx.imageSmoothingEnabled = false;
+    var n = this.cols * this.rows;
+    this.chars = new Uint16Array(n);
+    this.colors = new Uint8Array(n);
+    this.colZ = new Float32Array(this.cols);
+    this._buildAtlas();
+  };
+  Display.prototype._buildAtlas = function () {
+    var pw = this.cw, ph = this.ch;
+    var atlas = document.createElement("canvas");
+    atlas.width = 96 * pw; atlas.height = PALETTE.length * ph;
+    var actx = atlas.getContext("2d", { alpha: false });
+    actx.imageSmoothingEnabled = false;
+    actx.fillStyle = "#000"; actx.fillRect(0, 0, atlas.width, atlas.height);
+    actx.font = "700 " + Math.floor(ph * 0.82) + "px ui-monospace, Menlo, Consolas, monospace";
+    actx.textAlign = "center"; actx.textBaseline = "middle";
+    for (var ci = 0; ci < PALETTE.length; ci++) {
+      actx.fillStyle = PALETTE[ci];
+      for (var code = 33; code < 127; code++) {
+        actx.fillText(String.fromCharCode(code), (code - 32) * pw + pw / 2, ci * ph + ph / 2 + ph * 0.04);
+      }
+    }
+    this.atlas = atlas;
+  };
+  Display.prototype.present = function () {
+    var ctx = this.ctx, cols = this.cols, rows = this.rows, cw = this.cw, ch = this.ch;
+    var chars = this.chars, colors = this.colors, atlas = this.atlas;
+    ctx.fillStyle = "#000"; ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+    if (!atlas) return;
+    for (var y = 0; y < rows; y++) {
+      var row = y * cols, dy = y * ch;
+      for (var x = 0; x < cols; x++) {
+        var code = chars[row + x];
+        if (code <= 32 || code > 126) continue;
+        var ciCol = colors[row + x];
+        ctx.drawImage(atlas, (code - 32) * cw, ciCol * ch, cw, ch, x * cw, dy, cw, ch);
+      }
+    }
+  };
+
+  function renderFrame(map, cam, display, time) {
+    var cols = display.cols, rows = display.rows;
+    var chars = display.chars, colors = display.colors, colZ = display.colZ;
+    chars.fill(32); colors.fill(0);
+    var horizon = rows * 0.5 + cam.pitch * rows * 0.5;
+    var dirX = Math.cos(cam.yaw), dirY = Math.sin(cam.yaw);
+    var planeX = -dirY * cam.plane, planeY = dirX * cam.plane;
+    var posX = cam.x, posY = cam.y, eye = cam.eye;
+    var w = map.w, h = map.h, solid = map.solid;
+    var yawBucket = (cam.yaw * 20) | 0;
+
+    for (var x = 0; x < cols; x++) {
+      var cameraX = (2 * x) / cols - 1;
+      var rayDirX = dirX + planeX * cameraX;
+      var rayDirY = dirY + planeY * cameraX;
+      var mapX = posX | 0, mapY = posY | 0;
+      var deltaDistX = rayDirX === 0 ? 1e30 : Math.abs(1 / rayDirX);
+      var deltaDistY = rayDirY === 0 ? 1e30 : Math.abs(1 / rayDirY);
+      var stepX, stepY, sideDistX, sideDistY;
+      if (rayDirX < 0) { stepX = -1; sideDistX = (posX - mapX) * deltaDistX; }
+      else { stepX = 1; sideDistX = (mapX + 1 - posX) * deltaDistX; }
+      if (rayDirY < 0) { stepY = -1; sideDistY = (posY - mapY) * deltaDistY; }
+      else { stepY = 1; sideDistY = (mapY + 1 - posY) * deltaDistY; }
+
+      var side = 0, hit = false;
+      for (var s = 0; s < MAX_STEPS; s++) {
+        if (sideDistX < sideDistY) { sideDistX += deltaDistX; mapX += stepX; side = 0; }
+        else { sideDistY += deltaDistY; mapY += stepY; side = 1; }
+        if (mapX < 0 || mapY < 0 || mapX >= w || mapY >= h) { hit = false; break; }
+        if (solid[mapY * w + mapX]) { hit = true; break; }
+      }
+
+      var perpWallDist = 1e9;
+      if (hit) {
+        perpWallDist = side === 0 ? (sideDistX - deltaDistX) : (sideDistY - deltaDistY);
+        if (perpWallDist < 0.05) perpWallDist = 0.05;
+      }
+      colZ[x] = hit ? perpWallDist : 1e9;
+
+      if (hit) {
+        var idx = mapY * w + mapX;
+        var bh = map.height[idx] || 4;
+        var wallU = side === 0 ? (posY + perpWallDist * rayDirY) : (posX + perpWallDist * rayDirX);
+        wallU -= Math.floor(wallU);
+        var flip = (side === 0 && rayDirX > 0) || (side === 1 && rayDirY < 0);
+        if (flip) wallU = 1 - wallU;
+
+        var top = horizon - ((bh - eye) * rows) / perpWallDist;
+        var bot = horizon - ((0 - eye) * rows) / perpWallDist;
+        var y0 = Math.max(0, top | 0);
+        var y1 = Math.min(rows - 1, bot | 0);
+        var span = (bot - top) || 1;
+        var hueIdx = map.hue[idx];
+        for (var y = y0; y <= y1; y++) {
+          var v = (y - top) / span;
+          var packed = sampleWall(wallU, v, bh, hueIdx, perpWallDist, mapX, mapY, side);
+          if (packed) { var i = y * cols + x; chars[i] = packed >> 8; colors[i] = packed & 255; }
+        }
+        for (var yf = y1 + 1; yf < rows; yf++) {
+          var denomF = yf - horizon;
+          if (denomF <= 0.2) continue;
+          var rowDist = (eye * rows) / denomF;
+          if (rowDist > FOG_END + 2) continue;
+          var fx = posX + rayDirX * rowDist, fy = posY + rayDirY * rowDist;
+          var packedF = sampleFloor(map, fx, fy, rowDist);
+          if (packedF) { var iF = yf * cols + x; chars[iF] = packedF >> 8; colors[iF] = packedF & 255; }
+        }
+        for (var ys = 0; ys < y0; ys++) {
+          if ((hash3(x, ys, yawBucket) & 255) < 4) {
+            var iS = ys * cols + x; chars[iS] = CC("."); colors[iS] = 13;
+          }
+        }
+      } else {
+        for (var yy = 0; yy < rows; yy++) {
+          if (yy < horizon) {
+            if ((hash3(x, yy, yawBucket) & 255) < 4) {
+              var iSky = yy * cols + x; chars[iSky] = CC("."); colors[iSky] = 13;
+            }
+          } else {
+            var denom2 = yy - horizon;
+            if (denom2 <= 0.2) continue;
+            var rowDist2 = (eye * rows) / denom2;
+            if (rowDist2 > FOG_END + 2) continue;
+            var fx2 = posX + rayDirX * rowDist2, fy2 = posY + rayDirY * rowDist2;
+            var packed2 = sampleFloor(map, fx2, fy2, rowDist2);
+            if (packed2) { var i2 = yy * cols + x; chars[i2] = packed2 >> 8; colors[i2] = packed2 & 255; }
+          }
+        }
+      }
+    }
+  }
+
+  function spriteGlyph(kind, frac, seedJitter, time) {
+    if (kind === 0) {
+      if (frac > 0.8) return [CC("o"), 5];
+      return [CC("|"), 13];
+    }
+    if (kind === 1) {
+      if (frac > 0.85) {
+        var on1 = (((time * 2 + seedJitter) | 0) % 2) === 0;
+        return on1 ? [CC("o"), 11] : [CC("."), 13];
+      }
+      return [CC("|"), 13];
+    }
+    if (kind === 2) {
+      if (frac > 0.35) return [(((frac * 37 + seedJitter) | 0) % 2) ? CC("&") : CC("*"), 7];
+      return [CC("|"), 8];
+    }
+    if (kind === 3) {
+      if (frac > 0.92) {
+        var on3 = (((time * 2 + seedJitter) | 0) % 2) === 0;
+        return on3 ? [CC("o"), 11] : [CC("."), 13];
+      }
+      var rowInt = (frac * 20) | 0;
+      return (rowInt % 3 === 0) ? [CC("+"), 10] : [CC("|"), 13];
+    }
+    return [CC("?"), 12];
+  }
+
+  function drawSprites(sprites, cam, display, time) {
+    var cols = display.cols, rows = display.rows;
+    var chars = display.chars, colors = display.colors, colZ = display.colZ;
+    var dirX = Math.cos(cam.yaw), dirY = Math.sin(cam.yaw);
+    var planeX = -dirY * cam.plane, planeY = dirX * cam.plane;
+    var invDet = 1 / (planeX * dirY - dirX * planeY);
+    var horizon = rows * 0.5 + cam.pitch * rows * 0.5;
+    var perpX = -dirY, perpY = dirX;
+
+    var withDepth = [];
+    for (var k = 0; k < sprites.length; k++) {
+      var s = sprites[k];
+      var dx = s.x - cam.x, dy = s.y - cam.y;
+      var depth = invDet * (-planeY * dx + planeX * dy);
+      if (depth < 0.2 || depth > FOG_END) continue;
+      withDepth.push([depth, s]);
+    }
+    withDepth.sort(function (a, b) { return b[0] - a[0]; });
+
+    for (var n = 0; n < withDepth.length; n++) {
+      var txC2 = withDepth[n][0], s2 = withDepth[n][1];
+      var hw = (s2.w || 0.5) * 0.5;
+      var lx = s2.x - perpX * hw, ly = s2.y - perpY * hw;
+      var rx = s2.x + perpX * hw, ry = s2.y + perpY * hw;
+      var ldx = lx - cam.x, ldy = ly - cam.y;
+      var rdx = rx - cam.x, rdy = ry - cam.y;
+      var ltx = invDet * (-planeY * ldx + planeX * ldy), lty = invDet * (dirY * ldx - dirX * ldy);
+      var rtx = invDet * (-planeY * rdx + planeX * rdy), rty = invDet * (dirY * rdx - dirX * rdy);
+      if (ltx <= 0.05 && rtx <= 0.05) continue;
+      var lsx = (cols / 2) * (1 + lty / Math.max(0.05, ltx));
+      var rsx = (cols / 2) * (1 + rty / Math.max(0.05, rtx));
+      var c0 = Math.floor(Math.min(lsx, rsx)), c1 = Math.ceil(Math.max(lsx, rsx));
+      if (c1 < 0 || c0 >= cols) continue;
+      c0 = Math.max(0, c0); c1 = Math.min(cols - 1, c1);
+      var top = horizon - ((s2.z1 - cam.eye) * rows) / txC2;
+      var bot = horizon - ((s2.z0 - cam.eye) * rows) / txC2;
+      var y0 = Math.max(0, top | 0), y1 = Math.min(rows - 1, bot | 0);
+      if (y1 < y0) continue;
+      for (var xC = c0; xC <= c1; xC++) {
+        if (txC2 >= colZ[xC]) continue;
+        for (var yC = y0; yC <= y1; yC++) {
+          var frac = (bot - yC) / ((bot - top) || 1);
+          var g = spriteGlyph(s2.kind, frac, s2.seed, time);
+          var packed = fogPacked(g[0], g[1], txC2);
+          if (!packed) continue;
+          var i = yC * cols + xC;
+          chars[i] = packed >> 8; colors[i] = packed & 255;
+        }
+      }
+    }
+  }
+
+  function drawMinimap(map, cam, display) {
+    var cols = display.cols, chars = display.chars, colors = display.colors;
+    var R = 9, size = R * 2 + 1;
+    var ox = cols - size - 2, oy = 2;
+    if (ox < 0) return;
+    var pcx = cam.x | 0, pcy = cam.y | 0;
+    for (var j = 0; j < size; j++) {
+      for (var i = 0; i < size; i++) {
+        var wx = pcx - R + i, wy = pcy - R + j;
+        var ch = CC(" "), col = 0;
+        if (wx >= 0 && wy >= 0 && wx < map.w && wy < map.h) {
+          var idx = wy * map.w + wx;
+          if (map.solid[idx]) { ch = CC("#"); col = HUE_DIM[map.hue[idx]]; }
+          else {
+            var fl = map.floor[idx];
+            if (fl === F_PARK) { ch = CC("."); col = 8; }
+            else if (fl === F_PLAZA) { ch = CC("."); col = 10; }
+            else if (fl === F_ALLEY) { ch = CC("."); col = 14; }
+            else { ch = CC("."); col = 13; }
+          }
+        }
+        var bidx = (oy + j) * cols + (ox + i);
+        chars[bidx] = ch; colors[bidx] = col;
+      }
+    }
+    var dir = (((cam.yaw % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2));
+    var arrows = [">", "v", "<", "^"];
+    var seg = Math.round(dir / (Math.PI / 2)) % 4;
+    var idxC = (oy + R) * cols + (ox + R);
+    chars[idxC] = arrows[seg].charCodeAt(0);
+    colors[idxC] = 15;
+  }
+
+  function drawText(display, row, col, str, color) {
+    var cols = display.cols, chars = display.chars, colors = display.colors;
+    for (var i = 0; i < str.length; i++) {
+      var cx = col + i;
+      if (cx < 0 || cx >= cols) continue;
+      var idx = row * cols + cx;
+      chars[idx] = str.charCodeAt(i);
+      colors[idx] = color;
+    }
+  }
+
+  function isBlocked(map, x, y, r) {
+    var pts = [[x - r, y - r], [x + r, y - r], [x - r, y + r], [x + r, y + r]];
+    for (var i = 0; i < pts.length; i++) {
+      var mx = Math.floor(pts[i][0]), my = Math.floor(pts[i][1]);
+      if (mx < 0 || my < 0 || mx >= map.w || my >= map.h) return true;
+      if (map.solid[my * map.w + mx]) return true;
+    }
+    return false;
+  }
+
+  function updatePlayer(p, keys, dt, map) {
+    if (keys.turnL) p.yaw -= 2.4 * dt;
+    if (keys.turnR) p.yaw += 2.4 * dt;
+    var speed = keys.shift ? 6.4 : 3.2;
+    var fx = Math.cos(p.yaw), fy = Math.sin(p.yaw);
+    var rx = -fy, ry = fx;
+    var mx = 0, my = 0;
+    if (keys.forward) { mx += fx; my += fy; }
+    if (keys.back) { mx -= fx; my -= fy; }
+    if (keys.right) { mx += rx; my += ry; }
+    if (keys.left) { mx -= rx; my -= ry; }
+    var len = Math.hypot(mx, my);
+    p.moving = len > 0.0001;
+    if (p.moving) { mx /= len; my /= len; }
+    var nx = p.x + mx * speed * dt, ny = p.y + my * speed * dt;
+    var r = 0.28;
+    if (!isBlocked(map, nx, p.y, r)) p.x = nx;
+    if (!isBlocked(map, p.x, ny, r)) p.y = ny;
+  }
+
+  var canvas = document.getElementById("view");
+  var overlay = document.getElementById("overlay");
+  var seedline = document.getElementById("seedline");
+  var display = new Display(canvas);
+
+  var params = new URLSearchParams(location.search);
+  var seed = params.get("seed");
+  if (!seed) {
+    seed = String((Math.random() * 1e9) | 0);
+    history.replaceState(null, "", "?seed=" + encodeURIComponent(seed));
+  }
+  seedline.textContent = "SEED " + seed;
+
+  var city = generateCity(seed);
+  var spawn = findSpawn(city);
+  var player = { x: spawn.x, y: spawn.y, yaw: 0, pitch: 0, eye: 0.55, plane: 0.72, moving: false };
+  player.yaw = Math.atan2(city.plaza.y - player.y, city.plaza.x - player.x);
+
+  var keys = { forward: false, back: false, left: false, right: false, turnL: false, turnR: false, shift: false };
+  var minimapOn = false;
+  var locked = false;
+
+  window.addEventListener("keydown", function (e) {
+    switch (e.key) {
+      case "w": case "W": case "ArrowUp": keys.forward = true; break;
+      case "s": case "S": case "ArrowDown": keys.back = true; break;
+      case "a": case "A": keys.left = true; break;
+      case "d": case "D": keys.right = true; break;
+      case "ArrowLeft": keys.turnL = true; break;
+      case "ArrowRight": keys.turnR = true; break;
+      case "Shift": keys.shift = true; break;
+      case "m": case "M": minimapOn = !minimapOn; break;
+    }
+    if (keys.forward || keys.back || keys.left || keys.right || keys.turnL || keys.turnR) {
+      overlay.classList.add("hidden");
+    }
+  });
+  window.addEventListener("keyup", function (e) {
+    switch (e.key) {
+      case "w": case "W": case "ArrowUp": keys.forward = false; break;
+      case "s": case "S": case "ArrowDown": keys.back = false; break;
+      case "a": case "A": keys.left = false; break;
+      case "d": case "D": keys.right = false; break;
+      case "ArrowLeft": keys.turnL = false; break;
+      case "ArrowRight": keys.turnR = false; break;
+      case "Shift": keys.shift = false; break;
+    }
+  });
+
+  function requestLock() { canvas.requestPointerLock(); }
+  canvas.addEventListener("click", requestLock);
+  overlay.addEventListener("click", requestLock);
+  document.addEventListener("pointerlockchange", function () {
+    locked = document.pointerLockElement === canvas;
+    overlay.classList.toggle("hidden", locked);
+  });
+  document.addEventListener("mousemove", function (e) {
+    if (!locked) return;
+    player.yaw += e.movementX * 0.0022;
+    player.pitch = clamp(player.pitch - e.movementY * 0.0026, -1, 1);
+  });
+
+  function fit() { display.resize(window.innerWidth, window.innerHeight); }
+  fit();
+  window.addEventListener("resize", fit);
+
+  var last = performance.now();
+  var fpsEma = 60;
+
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    fpsEma = fpsEma * 0.9 + (1 / Math.max(dt, 0.0001)) * 0.1;
+
+    updatePlayer(player, keys, dt, city);
+    var t = now / 1000;
+    renderFrame(city, player, display, t);
+    drawSprites(city.props, player, display, t);
+    if (minimapOn) drawMinimap(city, player, display);
+    drawText(display, 0, 1, "SEED " + seed, 1);
+    var fpsTxt = Math.round(fpsEma) + " FPS";
+    drawText(display, 0, display.cols - fpsTxt.length - 1, fpsTxt, 1);
+    display.present();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
