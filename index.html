@@ -573,7 +573,12 @@
     }
   });
 
-  function requestLock() { canvas.requestPointerLock(); }
+  function requestLock() {
+    try {
+      var p = canvas.requestPointerLock();
+      if (p && p.catch) p.catch(function () {});
+    } catch (e) {}
+  }
   canvas.addEventListener("click", requestLock);
   overlay.addEventListener("click", requestLock);
   document.addEventListener("pointerlockchange", function () {
