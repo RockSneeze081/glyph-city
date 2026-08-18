@@ -25,10 +25,10 @@ Open <http://127.0.0.1:8765/>.
 
 | Input | Action |
 | --- | --- |
-| **WASD** / arrow up-down | Move |
+| **W / S** (or arrow up/down) | Walk forward / back |
+| **A / D** (or arrow left/right) | Turn — works without pointer lock |
 | **Shift** | Sprint |
-| **Mouse** (click to lock) | Look |
-| **&larr; / &rarr;** | Turn (works without pointer lock) |
+| **Mouse** (click to lock) | Full 360° look |
 | **M** | Toggle minimap |
 
 ## URL parameters

@@ -33,13 +33,13 @@
 <body>
 <canvas id="view"></canvas>
 <div id="scan"></div>
-<div id="hint">CLICK TO LOOK · WASD MOVE · SHIFT SPRINT · ARROWS TURN/MOVE · M MINIMAP</div>
+<div id="hint">CLICK FOR MOUSE LOOK · W/S WALK · A/D TURN · SHIFT SPRINT · M MINIMAP</div>
 <div id="overlay">
   <h1>GLYPH CITY</h1>
   <p>A walkable ASCII cyberpunk downtown, rendered live by a 2.5D raycaster —
      every wall, window and rooftop light on screen is a character, not a pixel.</p>
-  <p><span class="kbd">WASD</span> move &nbsp; <span class="kbd">SHIFT</span> sprint &nbsp;
-     <span class="kbd">MOUSE</span> look &nbsp; <span class="kbd">&larr;/&rarr;</span> turn &nbsp;
+  <p><span class="kbd">W/S</span> walk &nbsp; <span class="kbd">A/D</span> turn &nbsp;
+     <span class="kbd">SHIFT</span> sprint &nbsp; <span class="kbd">MOUSE</span> look &nbsp;
      <span class="kbd">M</span> minimap</p>
   <p class="seed" id="seedline">SEED …</p>
   <p>click anywhere to jack in</p>
@@ -509,12 +509,9 @@
     if (keys.turnR) p.yaw += 2.4 * dt;
     var speed = keys.shift ? 6.4 : 3.2;
     var fx = Math.cos(p.yaw), fy = Math.sin(p.yaw);
-    var rx = -fy, ry = fx;
     var mx = 0, my = 0;
     if (keys.forward) { mx += fx; my += fy; }
     if (keys.back) { mx -= fx; my -= fy; }
-    if (keys.right) { mx += rx; my += ry; }
-    if (keys.left) { mx -= rx; my -= ry; }
     var len = Math.hypot(mx, my);
     p.moving = len > 0.0001;
     if (p.moving) { mx /= len; my /= len; }
@@ -542,7 +539,7 @@
   var player = { x: spawn.x, y: spawn.y, yaw: 0, pitch: 0, eye: 0.55, plane: 0.72, moving: false };
   player.yaw = Math.atan2(city.plaza.y - player.y, city.plaza.x - player.x);
 
-  var keys = { forward: false, back: false, left: false, right: false, turnL: false, turnR: false, shift: false };
+  var keys = { forward: false, back: false, turnL: false, turnR: false, shift: false };
   var minimapOn = false;
   var locked = false;
 
@@ -550,14 +547,12 @@
     switch (e.key) {
       case "w": case "W": case "ArrowUp": keys.forward = true; break;
       case "s": case "S": case "ArrowDown": keys.back = true; break;
-      case "a": case "A": keys.left = true; break;
-      case "d": case "D": keys.right = true; break;
-      case "ArrowLeft": keys.turnL = true; break;
-      case "ArrowRight": keys.turnR = true; break;
+      case "a": case "A": case "ArrowLeft": keys.turnL = true; break;
+      case "d": case "D": case "ArrowRight": keys.turnR = true; break;
       case "Shift": keys.shift = true; break;
       case "m": case "M": minimapOn = !minimapOn; break;
     }
-    if (keys.forward || keys.back || keys.left || keys.right || keys.turnL || keys.turnR) {
+    if (keys.forward || keys.back || keys.turnL || keys.turnR) {
       overlay.classList.add("hidden");
     }
   });
@@ -565,15 +560,18 @@
     switch (e.key) {
       case "w": case "W": case "ArrowUp": keys.forward = false; break;
       case "s": case "S": case "ArrowDown": keys.back = false; break;
-      case "a": case "A": keys.left = false; break;
-      case "d": case "D": keys.right = false; break;
-      case "ArrowLeft": keys.turnL = false; break;
-      case "ArrowRight": keys.turnR = false; break;
+      case "a": case "A": case "ArrowLeft": keys.turnL = false; break;
+      case "d": case "D": case "ArrowRight": keys.turnR = false; break;
       case "Shift": keys.shift = false; break;
     }
   });
 
-  function requestLock() { canvas.requestPointerLock(); }
+  function requestLock() {
+    try {
+      var p = canvas.requestPointerLock();
+      if (p && p.catch) p.catch(function () {});
+    } catch (e) {}
+  }
   canvas.addEventListener("click", requestLock);
   overlay.addEventListener("click", requestLock);
   document.addEventListener("pointerlockchange", function () {
